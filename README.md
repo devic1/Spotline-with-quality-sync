@@ -6,9 +6,10 @@ A GNOME Shell extension that displays the currently playing Spotify song and rea
 
 ## ✨ Features & Improvements
 
-- **Accurate Lyrics Finder**:
+- **Accurate Lyrics Finder & Resilient Polling**:
   - Searches LRCLIB (`/api/search?q=...`) using the exact track title.
   - Automatically filters candidates within $\pm 5$ seconds duration drift and sorts by closest duration match to the playing track.
+  - **Resilient Retry Polling**: If the lyrics API returns an error (e.g. HTTP 503 Service Unavailable) or transient failure, Spotline runs backup retries with staggered intervals (1s, 3s, 6s, 12s) for up to 30 seconds per song before cleanly stopping.
   - Seamlessly falls back to the track title if no synced lyrics match, preventing stuck first lines or unsynced plain text.
 
 - **Added Quality Inspector (Zero-Debug Native)**:
