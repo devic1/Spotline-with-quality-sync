@@ -182,6 +182,9 @@ const MusicLyricsIndicator = GObject.registerClass(
             this._spotifyPids = [];
             this._lastTrackTitle = null;
             this._isShowingTrackTitle = false;
+            this._lyricsRetryTimeoutId = null;
+            this._lyricsRetryIndex = 0;
+            this._lyricsRetryStartTime = 0;
 
             // Internal state for lyrics - using GSettings for preferences now
             this._showLyrics = true;
@@ -281,6 +284,7 @@ const MusicLyricsIndicator = GObject.registerClass(
             this._lyricsToggle.connect('toggled', (item) => {
                 this._showLyrics = item.state;
                 if (!item.state) {
+                    this._clearLyricsRetry();
                     if (this._lyricsTimeoutId) {
                         GLib.source_remove(this._lyricsTimeoutId);
                         this._lyricsTimeoutId = null;
@@ -637,6 +641,8 @@ const MusicLyricsIndicator = GObject.registerClass(
                 this._lyricsTimeoutId = null;
             }
 
+            this._clearLyricsRetry();
+
             this._proxy = null;
             this._playerProxy = null;
             this._currentTrack = null;
@@ -738,6 +744,8 @@ const MusicLyricsIndicator = GObject.registerClass(
                     this._resetQualityVerification();
                     this._startQualityVerification();
 
+                    this._clearLyricsRetry();
+
                     // Immediately display the new track title on the panel
                     this._isShowingTrackTitle = true;
                     this._currentLine = '';
@@ -750,7 +758,7 @@ const MusicLyricsIndicator = GObject.registerClass(
                         this._isShowingTrackTitle = false;
                         this._updateLabelText(this._currentTrack.title, false);
                     }
-                } else if (this._showLyrics && !this._currentLyrics && !this._lyricsTimeoutId && !this._isShowingTrackTitle) {
+                } else if (this._showLyrics && !this._currentLyrics && !this._lyricsTimeoutId && !this._lyricsRetryTimeoutId && !this._isShowingTrackTitle) {
                     this._fetchLyrics(this._currentTrack.title, this._currentTrackDurationSeconds);
                 }
 
@@ -761,14 +769,74 @@ const MusicLyricsIndicator = GObject.registerClass(
             }
         }
 
-        _fetchLyrics(title, actualDurationSeconds) {
-            // Clear any existing lyrics timeout
+        _clearLyricsRetry() {
+            if (this._lyricsRetryTimeoutId) {
+                GLib.source_remove(this._lyricsRetryTimeoutId);
+                this._lyricsRetryTimeoutId = null;
+            }
+            this._lyricsRetryIndex = 0;
+            this._lyricsRetryStartTime = 0;
+        }
+
+        _scheduleLyricsRetry(title, actualDurationSeconds) {
+            // Abort if track changed, lyrics are disabled, or lyrics already found
+            if (!this._currentTrack || this._currentTrack.title !== title || !this._showLyrics || this._currentLyrics) {
+                this._clearLyricsRetry();
+                return;
+            }
+
+            // Retry intervals: 1s, 3s, 6s, 12s; stop after 30 seconds total limit
+            const RETRY_DELAYS = [1000, 3000, 6000, 12000];
+            const MAX_RETRY_DURATION_MS = 30000;
+
+            const nowMs = GLib.get_monotonic_time() / 1000;
+            if (!this._lyricsRetryStartTime) {
+                this._lyricsRetryStartTime = nowMs;
+            }
+            const elapsedMs = nowMs - this._lyricsRetryStartTime;
+            const remainingMs = MAX_RETRY_DURATION_MS - elapsedMs;
+
+            if (this._lyricsRetryIndex < RETRY_DELAYS.length && remainingMs > 1000) {
+                const delayMs = Math.min(RETRY_DELAYS[this._lyricsRetryIndex], remainingMs);
+                this._lyricsRetryIndex++;
+
+                // Ensure the song title stays displayed while polling
+                this._isShowingTrackTitle = true;
+                this._updateLabelText(title, false);
+
+                if (this._lyricsRetryTimeoutId) {
+                    GLib.source_remove(this._lyricsRetryTimeoutId);
+                    this._lyricsRetryTimeoutId = null;
+                }
+
+                this._lyricsRetryTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, delayMs, () => {
+                    this._lyricsRetryTimeoutId = null;
+                    if (this._currentTrack && this._currentTrack.title === title && this._showLyrics && !this._currentLyrics) {
+                        this._fetchLyrics(title, actualDurationSeconds, true);
+                    }
+                    return GLib.SOURCE_REMOVE;
+                });
+            } else {
+                // Exhausted retries or 30-second window reached: stop polling
+                this._clearLyricsRetry();
+                this._isShowingTrackTitle = false;
+                this._updateLabelText(title, false);
+            }
+        }
+
+        _fetchLyrics(title, actualDurationSeconds, isRetry = false) {
+            // Clear any existing lyrics display loop timeout
             if (this._lyricsTimeoutId) {
                 GLib.source_remove(this._lyricsTimeoutId);
                 this._lyricsTimeoutId = null;
             }
-            this._currentLyrics = null;
-            this._currentLine = '';
+
+            if (!isRetry) {
+                this._clearLyricsRetry();
+                this._lyricsRetryStartTime = GLib.get_monotonic_time() / 1000;
+                this._currentLyrics = null;
+                this._currentLine = '';
+            }
 
             // Search for lyrics using exact track title in the 'q' parameter
             const url = `${LYRICS_API_URL}?q=${encodeURIComponent(title)}`;
@@ -780,13 +848,13 @@ const MusicLyricsIndicator = GObject.registerClass(
                     const [success, contents] = source.load_contents_finish(result);
 
                     // Check if current track changed while request was in flight
-                    if (this._currentTrack && this._currentTrack.title !== title) {
+                    if (!this._currentTrack || this._currentTrack.title !== title) {
+                        this._clearLyricsRetry();
                         return;
                     }
 
                     if (!success) {
-                        this._isShowingTrackTitle = false;
-                        this._updateLabelText(title, false);
+                        this._scheduleLyricsRetry(title, actualDurationSeconds);
                         return;
                     }
 
@@ -795,8 +863,7 @@ const MusicLyricsIndicator = GObject.registerClass(
                     const records = JSON.parse(response);
 
                     if (!Array.isArray(records) || records.length === 0) {
-                        this._isShowingTrackTitle = false;
-                        this._updateLabelText(title, false);
+                        this._scheduleLyricsRetry(title, actualDurationSeconds);
                         return;
                     }
 
@@ -828,18 +895,17 @@ const MusicLyricsIndicator = GObject.registerClass(
                     }
 
                     if (matchedLyrics) {
+                        this._clearLyricsRetry();
                         this._currentLyrics = this._parseLRC(matchedLyrics);
                         this._startLyricsDisplay();
                     } else {
                         // If no results within drifted seconds limit or no syncedlyrics found,
-                        // use its title instead of stuck firstline lyrics
-                        this._isShowingTrackTitle = false;
-                        this._updateLabelText(title, false);
+                        // retry with backoff polling before giving up
+                        this._scheduleLyricsRetry(title, actualDurationSeconds);
                     }
                 } catch (e) {
                     logError(e, 'Failed to fetch lyrics');
-                    this._isShowingTrackTitle = false;
-                    this._updateLabelText(title, false);
+                    this._scheduleLyricsRetry(title, actualDurationSeconds);
                 }
             });
         }
@@ -1027,6 +1093,8 @@ const MusicLyricsIndicator = GObject.registerClass(
                 GLib.source_remove(this._lyricsTimeoutId);
                 this._lyricsTimeoutId = null;
             }
+
+            this._clearLyricsRetry();
 
             if (this._propertiesChangedId && this._playerProxy) {
                 this._playerProxy.disconnect(this._propertiesChangedId);
