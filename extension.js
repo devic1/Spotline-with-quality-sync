@@ -8,31 +8,108 @@ import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
 
+const SPOTIFY_BUS_NAME = 'org.mpris.MediaPlayer2.spotify';
 const MPRIS_PLAYER_PATH = '/org/mpris/MediaPlayer2';
 const MPRIS_PLAYER_INTERFACE = 'org.mpris.MediaPlayer2.Player';
 
 // Lyrics API configuration
-const LYRICS_API_URL = 'https://lrclib.net/api/get';
+const LYRICS_API_URL = 'https://lrclib.net/api/search';
 
-// Helper function to check if a bus name is a supported music player
-function isSupportedPlayer(busName) {
-    // Desktop apps
-    if (busName === 'org.mpris.MediaPlayer2.spotify' ||
-        busName === 'org.mpris.MediaPlayer2.youtube-music') {
-        return true;
+// Helper function to format duration in microseconds to mm:ss with time units (e.g. 5m 00s or 1h 05m 20s)
+function formatDuration(microseconds) {
+    if (typeof microseconds === 'bigint') {
+        microseconds = Number(microseconds);
     }
+    if (!microseconds || isNaN(microseconds) || microseconds <= 0) {
+        return null;
+    }
+    const totalSeconds = Math.round(microseconds / 1000000);
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
 
-    // Browser-based players (chromium, chrome, firefox, etc.)
-    // These have instance IDs like: org.mpris.MediaPlayer2.chromium.instance12345
-    const browserPatterns = [
-        /^org\.mpris\.MediaPlayer2\.chromium\.instance\d+$/,
-        /^org\.mpris\.MediaPlayer2\.chrome\.instance\d+$/,
-        /^org\.mpris\.MediaPlayer2\.firefox\.instance\d+$/,
-        /^org\.mpris\.MediaPlayer2\.brave\.instance\d+$/,
-        /^org\.mpris\.MediaPlayer2\.edge\.instance\d+$/
-    ];
+    const paddedSeconds = seconds.toString().padStart(2, '0');
+    if (hours > 0) {
+        const paddedMinutes = minutes.toString().padStart(2, '0');
+        return `${hours}h ${paddedMinutes}m ${paddedSeconds}s`;
+    }
+    return `${minutes}m ${paddedSeconds}s`;
+}
 
-    return browserPatterns.some(pattern => pattern.test(busName));
+
+// Read seek cursor position from /proc/<pid>/fdinfo/<fd>
+function getFdPos(pid, fd) {
+    try {
+        const [ok, contents] = GLib.file_get_contents(`/proc/${pid}/fdinfo/${fd}`);
+        if (!ok) return 0;
+        const text = new TextDecoder('utf-8').decode(contents);
+        const m = text.match(/^pos:\s*(\d+)/m);
+        return m ? parseInt(m[1], 10) : 0;
+    } catch (e) {
+        return 0;
+    }
+}
+
+// Find all Spotify PIDs for the current user
+function findSpotifyPids() {
+    try {
+        const username = GLib.get_user_name();
+        let [res, out, err, status] = GLib.spawn_command_line_sync(`pgrep -u ${username} -x spotify`);
+        if (!res || status !== 0 || !out || out.length === 0) {
+            [res, out, err, status] = GLib.spawn_command_line_sync(`pgrep -u ${username} -f usr/share/spotify/spotify`);
+        }
+        if (!res || status !== 0 || !out) return [];
+        const text = new TextDecoder('utf-8').decode(out);
+        return text.trim().split(/\s+/).map(p => parseInt(p, 10)).filter(p => !isNaN(p));
+    } catch (e) {
+        return [];
+    }
+}
+
+// Find open Spotify audio stream cache file in /proc/<pid>/fd/
+function findActiveAudioCache(pids) {
+    const candidates = [];
+    for (const pid of pids) {
+        const fdDir = `/proc/${pid}/fd`;
+        try {
+            const dir = Gio.File.new_for_path(fdDir);
+            const enumerator = dir.enumerate_children(
+                'standard::*',
+                Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS,
+                null
+            );
+            let info;
+            while ((info = enumerator.next_file(null)) !== null) {
+                const name = info.get_name();
+                const linkTarget = GLib.file_read_link(`${fdDir}/${name}`);
+                if (linkTarget && linkTarget.endsWith('.file') && linkTarget.includes('/Data/')) {
+                    try {
+                        const file = Gio.File.new_for_path(linkTarget);
+                        const qInfo = file.query_info(
+                            'standard::size,time::modified',
+                            Gio.FileQueryInfoFlags.NONE,
+                            null
+                        );
+                        const pos = getFdPos(pid, name);
+                        candidates.push({
+                            pid: pid,
+                            fd: name,
+                            path: linkTarget,
+                            logicalSize: qInfo.get_size(),
+                            pos: pos,
+                            mtime: qInfo.get_attribute_uint64('time::modified')
+                        });
+                    } catch (err) {}
+                }
+            }
+        } catch (e) {}
+    }
+    if (candidates.length === 0) return null;
+    candidates.sort((a, b) => {
+        if (b.pos !== a.pos) return b.pos - a.pos;
+        return b.mtime - a.mtime;
+    });
+    return candidates[0];
 }
 
 const MusicLyricsIndicator = GObject.registerClass(
@@ -48,7 +125,7 @@ const MusicLyricsIndicator = GObject.registerClass(
             });
 
             this._label = new St.Label({
-                text: 'No music playing',
+                text: '',
                 y_align: Clutter.ActorAlign.CENTER,
                 style_class: 'spotify-lyrics-label'
             });
@@ -92,11 +169,19 @@ const MusicLyricsIndicator = GObject.registerClass(
             this._currentTrack = null;
             this._currentLyrics = null;
             this._currentLine = '';
+            this._currentTrackDuration = null;
             this._proxy = null;
+            this._playerProxy = null;
             this._propertiesChangedId = null;
             this._lyricsTimeoutId = null;
-            this._currentBusName = null;
             this._busWatchId = null;
+            this._spotifyRunning = false;
+            this._verifiedQuality = null;
+            this._qualitySampleTimeoutId = null;
+            this._qualityPollTimeoutId = null;
+            this._spotifyPids = [];
+            this._lastTrackTitle = null;
+            this._isShowingTrackTitle = false;
 
             // Internal state for lyrics - using GSettings for preferences now
             this._showLyrics = true;
@@ -107,6 +192,7 @@ const MusicLyricsIndicator = GObject.registerClass(
             });
 
             this._buildMenu();
+            this.updateVisibility();
             this._setupDBusMonitoring();
         }
 
@@ -131,11 +217,15 @@ const MusicLyricsIndicator = GObject.registerClass(
                 style_class: 'popup-menu-item',
                 x_expand: true,
                 x_align: Clutter.ActorAlign.CENTER,
+                reactive: true,
                 style: 'spacing: 12px;'
             });
 
             const prevButton = new St.Button({
                 style_class: 'button',
+                can_focus: true,
+                reactive: true,
+                track_hover: true,
                 child: new St.Icon({
                     icon_name: 'media-skip-backward-symbolic',
                     icon_size: 20
@@ -145,6 +235,9 @@ const MusicLyricsIndicator = GObject.registerClass(
 
             const playPauseButton = new St.Button({
                 style_class: 'button',
+                can_focus: true,
+                reactive: true,
+                track_hover: true,
                 child: new St.Icon({
                     icon_name: 'media-playback-start-symbolic',
                     icon_size: 20
@@ -155,6 +248,9 @@ const MusicLyricsIndicator = GObject.registerClass(
 
             const nextButton = new St.Button({
                 style_class: 'button',
+                can_focus: true,
+                reactive: true,
+                track_hover: true,
                 child: new St.Icon({
                     icon_name: 'media-skip-forward-symbolic',
                     icon_size: 20
@@ -167,7 +263,9 @@ const MusicLyricsIndicator = GObject.registerClass(
             controlsBox.add_child(nextButton);
 
             const controlsItem = new PopupMenu.PopupBaseMenuItem({
-                reactive: false,
+                reactive: true,
+                activate: false,
+                hover: false,
                 can_focus: false
             });
             controlsItem.add_child(controlsBox);
@@ -187,19 +285,33 @@ const MusicLyricsIndicator = GObject.registerClass(
                         GLib.source_remove(this._lyricsTimeoutId);
                         this._lyricsTimeoutId = null;
                     }
-                    this._updateTrackInfo();
+                    this._currentLyrics = null;
+                    this._isShowingTrackTitle = false;
+                    if (this._currentTrack) {
+                        this._updateLabelText(this._currentTrack.title, false);
+                    }
                 } else {
-                    this._updateTrackInfo();
+                    if (this._currentTrack) {
+                        this._isShowingTrackTitle = true;
+                        this._fetchLyrics(this._currentTrack.title, this._currentTrackDurationSeconds);
+                    }
                 }
             });
             this.menu.addMenuItem(this._lyricsToggle);
 
+            // Song duration and audio quality display
+            this._durationItem = new PopupMenu.PopupMenuItem('--:--', {
+                reactive: false
+            });
+            this._durationItem.label.style = 'font-size: 0.9em; color: #888;';
+            this.menu.addMenuItem(this._durationItem);
+
             this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
             // Refresh button
-            const refreshItem = new PopupMenu.PopupMenuItem('Refresh Player');
+            const refreshItem = new PopupMenu.PopupMenuItem('Refresh Spotify');
             refreshItem.connect('activate', () => {
-                this._findActivePlayer();
+                this._connectToSpotify();
             });
             this.menu.addMenuItem(refreshItem);
 
@@ -211,15 +323,19 @@ const MusicLyricsIndicator = GObject.registerClass(
             // GitHub link
             const githubItem = new PopupMenu.PopupMenuItem('View on GitHub');
             githubItem.connect('activate', () => {
-                Gio.AppInfo.launch_default_for_uri(
-                    'https://github.com/d3osaju/Spotline',
-                    null
-                );
+                try {
+                    Gio.AppInfo.launch_default_for_uri(
+                        'https://github.com/devic1/Spotline-with-quality-sync',
+                        global.create_app_launch_context(0, -1)
+                    );
+                } catch (e) {
+                    logError(e, 'Failed to open GitHub link');
+                }
             });
             this._infoSubmenu.menu.addMenuItem(githubItem);
 
             // Credits
-            const creditsItem = new PopupMenu.PopupMenuItem('Created by deosaju', {
+            const creditsItem = new PopupMenu.PopupMenuItem('Created by d3osaju, Forked by devic1', {
                 reactive: false
             });
             creditsItem.label.style = 'font-size: 0.9em; color: #888;';
@@ -240,7 +356,13 @@ const MusicLyricsIndicator = GObject.registerClass(
                     Gio.DBusCallFlags.NONE,
                     -1,
                     null,
-                    null
+                    (proxy, result) => {
+                        try {
+                            proxy.call_finish(result);
+                        } catch (e) {
+                            logError(e, `Failed to finish ${action}`);
+                        }
+                    }
                 );
             } catch (e) {
                 logError(e, `Failed to ${action}`);
@@ -264,136 +386,230 @@ const MusicLyricsIndicator = GObject.registerClass(
             }
         }
 
+        updateVisibility() {
+            const visible = Boolean(this._spotifyRunning);
+            this.visible = visible;
+            if (this.container) {
+                this.container.visible = visible;
+            }
+        }
+
+        _resetQualityVerification() {
+            if (this._qualitySampleTimeoutId) {
+                GLib.source_remove(this._qualitySampleTimeoutId);
+                this._qualitySampleTimeoutId = null;
+            }
+            if (this._qualityPollTimeoutId) {
+                GLib.source_remove(this._qualityPollTimeoutId);
+                this._qualityPollTimeoutId = null;
+            }
+            this._verifiedQuality = null;
+        }
+
+        _startQualityVerification() {
+            if (!this._spotifyRunning || !this._currentTrack) {
+                return;
+            }
+
+            if (!this._spotifyPids || this._spotifyPids.length === 0) {
+                this._spotifyPids = findSpotifyPids();
+            }
+
+            if (!this._spotifyPids || this._spotifyPids.length === 0) {
+                this._updateDurationDisplay();
+                return;
+            }
+
+            const active = findActiveAudioCache(this._spotifyPids);
+            if (!active) {
+                // If audio file is not opened yet, retry in 1 second
+                this._qualitySampleTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1000, () => {
+                    this._qualitySampleTimeoutId = null;
+                    this._startQualityVerification();
+                    return GLib.SOURCE_REMOVE;
+                });
+                return;
+            }
+
+            const trackTitle = this._currentTrack.title;
+            const initialSize = active.logicalSize;
+            const filePath = active.path;
+            const durationSeconds = this._currentTrackDurationSeconds || 0;
+
+            // Sample file growth over 1.0 second window
+            this._qualitySampleTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1000, () => {
+                this._qualitySampleTimeoutId = null;
+
+                // Make sure track didn't change while waiting
+                if (!this._currentTrack || this._currentTrack.title !== trackTitle) {
+                    return GLib.SOURCE_REMOVE;
+                }
+
+                let newSize = initialSize;
+                try {
+                    const file = Gio.File.new_for_path(filePath);
+                    const qInfo = file.query_info('standard::size', Gio.FileQueryInfoFlags.NONE, null);
+                    newSize = qInfo.get_size();
+                } catch (e) {
+                    return GLib.SOURCE_REMOVE;
+                }
+
+                const deltaBytes = newSize - initialSize;
+                if (deltaBytes > 0) {
+                    // Download in progress / actively buffering
+                    const mb = (newSize / (1024 * 1024)).toFixed(1);
+                    this._verifiedQuality = {
+                        buffering: true,
+                        mb: mb,
+                        fileSize: newSize
+                    };
+                    this._updateDurationDisplay();
+
+                    // Re-sample in 1.0 second
+                    this._qualitySampleTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1000, () => {
+                        this._qualitySampleTimeoutId = null;
+                        this._startQualityVerification();
+                        return GLib.SOURCE_REMOVE;
+                    });
+                    return GLib.SOURCE_REMOVE;
+                }
+
+                // deltaBytes === 0: Complete and stable!
+                const durS = durationSeconds > 0 ? durationSeconds : 1;
+                const kbps = Math.round((newSize * 8) / durS / 1000);
+                const mb = (newSize / (1024 * 1024)).toFixed(1);
+
+                this._verifiedQuality = {
+                    verified: true,
+                    buffering: false,
+                    calculated: `~${kbps}kbps (${mb}MB)`,
+                    kbps: kbps,
+                    mb: mb,
+                    fileSize: newSize,
+                    filePath: filePath,
+                    pid: active.pid,
+                    fd: active.fd
+                };
+
+                this._updateDurationDisplay();
+
+                // Start 10-second polling for stream updates
+                this._startQualityPolling(filePath, trackTitle);
+
+                return GLib.SOURCE_REMOVE;
+            });
+        }
+
+        _startQualityPolling(filePath, trackTitle) {
+            if (this._qualityPollTimeoutId) {
+                GLib.source_remove(this._qualityPollTimeoutId);
+                this._qualityPollTimeoutId = null;
+            }
+
+            this._qualityPollTimeoutId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 10, () => {
+                // If song changed or Spotify closed, stop polling
+                if (!this._currentTrack || this._currentTrack.title !== trackTitle || !this._spotifyRunning) {
+                    this._qualityPollTimeoutId = null;
+                    return GLib.SOURCE_REMOVE;
+                }
+
+                try {
+                    const file = Gio.File.new_for_path(filePath);
+                    if (!file.query_exists(null)) {
+                        this._qualityPollTimeoutId = null;
+                        this._startQualityVerification();
+                        return GLib.SOURCE_REMOVE;
+                    }
+
+                    const qInfo = file.query_info('standard::size', Gio.FileQueryInfoFlags.NONE, null);
+                    const currentSize = qInfo.get_size();
+                    const prevSize = this._verifiedQuality ? this._verifiedQuality.fileSize : 0;
+
+                    if (currentSize > prevSize) {
+                        // File grew! Re-verify stability
+                        this._qualityPollTimeoutId = null;
+                        this._startQualityVerification();
+                        return GLib.SOURCE_REMOVE;
+                    } else if (this._verifiedQuality && this._verifiedQuality.verified) {
+                        // Update display if needed
+                        this._updateDurationDisplay();
+                    }
+                } catch (e) {
+                    logError(e, 'Failed to poll Spotify audio file size');
+                }
+
+                return GLib.SOURCE_CONTINUE;
+            });
+        }
+
+        _updateDurationDisplay() {
+            if (!this._durationItem) {
+                return;
+            }
+
+            const dur = this._currentTrackDuration || '--:--';
+            const q = this._verifiedQuality;
+
+            if (q && q.verified) {
+                this._durationItem.label.text = `${dur} | ${q.calculated}`;
+            } else if (q && q.buffering) {
+                this._durationItem.label.text = `${dur} | Buffering (${q.mb}MB)`;
+            } else if (this._currentTrackDuration) {
+                this._durationItem.label.text = `${this._currentTrackDuration} | Quality: Unverified`;
+            } else {
+                this._durationItem.label.text = '--:--';
+            }
+        }
+
         _setupDBusMonitoring() {
-            // Watch for new media players appearing on the bus
+            // Watch specifically for Spotify appearing/vanishing on the session bus
             this._busWatchId = Gio.bus_watch_name(
                 Gio.BusType.SESSION,
-                'org.mpris.MediaPlayer2.*',
+                SPOTIFY_BUS_NAME,
                 Gio.BusNameWatcherFlags.NONE,
-                () => this._findActivePlayer(),
-                () => this._findActivePlayer()
+                () => this._onSpotifyAppeared(),
+                () => this._onSpotifyVanished()
             );
-
-            this._findActivePlayer();
         }
 
-        _findActivePlayer() {
-            try {
-                const dbusProxy = Gio.DBusProxy.new_for_bus_sync(
-                    Gio.BusType.SESSION,
-                    Gio.DBusProxyFlags.NONE,
-                    null,
-                    'org.freedesktop.DBus',
-                    '/org/freedesktop/DBus',
-                    'org.freedesktop.DBus',
-                    null
-                );
-
-                dbusProxy.call(
-                    'ListNames',
-                    null,
-                    Gio.DBusCallFlags.NONE,
-                    -1,
-                    null,
-                    (proxy, result) => {
-                        try {
-                            const reply = proxy.call_finish(result);
-                            const names = reply.get_child_value(0).deep_unpack();
-
-                            // First try to find a playing supported player
-                            let foundPlayer = null;
-
-                            for (const name of names) {
-                                if (isSupportedPlayer(name)) {
-                                    if (this._isPlayerPlaying(name)) {
-                                        foundPlayer = name;
-                                        break;
-                                    }
-                                }
-                            }
-
-                            // If no playing player, connect to any supported player
-                            if (!foundPlayer) {
-                                for (const name of names) {
-                                    if (isSupportedPlayer(name)) {
-                                        foundPlayer = name;
-                                        break;
-                                    }
-                                }
-                            }
-
-                            if (foundPlayer) {
-                                this._tryConnectToPlayer(foundPlayer);
-                            } else {
-                                this._updateLabelText('No music playing');
-                            }
-                        } catch (e) {
-                            logError(e, 'Failed to list DBus names');
-                            this._updateLabelText('No music playing');
-                        }
-                    }
-                );
-            } catch (e) {
-                logError(e, 'Failed to query DBus');
-                this._updateLabelText('No music playing');
-            }
+        _onSpotifyAppeared() {
+            this._spotifyRunning = true;
+            this.updateVisibility();
+            this._connectToSpotify();
         }
 
-        _isPlayerPlaying(busName) {
-            try {
-                const playerProxy = Gio.DBusProxy.new_for_bus_sync(
-                    Gio.BusType.SESSION,
-                    Gio.DBusProxyFlags.NONE,
-                    null,
-                    busName,
-                    MPRIS_PLAYER_PATH,
-                    MPRIS_PLAYER_INTERFACE,
-                    null
-                );
+        _onSpotifyVanished() {
+            this._spotifyRunning = false;
+            this.updateVisibility();
+            this._disconnectSpotify();
+        }
 
-                const playbackStatus = playerProxy.get_cached_property('PlaybackStatus');
-                if (playbackStatus) {
-                    const status = playbackStatus.unpack();
-                    return status === 'Playing';
+        _connectToSpotify() {
+            try {
+                if (this._propertiesChangedId && this._playerProxy) {
+                    this._playerProxy.disconnect(this._propertiesChangedId);
+                    this._propertiesChangedId = null;
                 }
-            } catch (e) {
-                // Ignore errors, player might not be available
-            }
-            return false;
-        }
 
-        _tryConnectToPlayer(busName) {
-            try {
-                // Create proxy for properties interface
-                const proxy = Gio.DBusProxy.new_for_bus_sync(
+                this._proxy = Gio.DBusProxy.new_for_bus_sync(
                     Gio.BusType.SESSION,
                     Gio.DBusProxyFlags.NONE,
                     null,
-                    busName,
+                    SPOTIFY_BUS_NAME,
                     MPRIS_PLAYER_PATH,
                     'org.freedesktop.DBus.Properties',
                     null
                 );
 
-                // Create proxy for player interface to monitor changes
-                const playerProxy = Gio.DBusProxy.new_for_bus_sync(
+                this._playerProxy = Gio.DBusProxy.new_for_bus_sync(
                     Gio.BusType.SESSION,
                     Gio.DBusProxyFlags.NONE,
                     null,
-                    busName,
+                    SPOTIFY_BUS_NAME,
                     MPRIS_PLAYER_PATH,
                     MPRIS_PLAYER_INTERFACE,
                     null
                 );
-
-                // Disconnect previous player if any
-                if (this._propertiesChangedId && this._playerProxy) {
-                    this._playerProxy.disconnect(this._propertiesChangedId);
-                }
-
-                this._proxy = proxy;
-                this._playerProxy = playerProxy;
-                this._currentBusName = busName;
 
                 this._propertiesChangedId = this._playerProxy.connect(
                     'g-properties-changed',
@@ -402,45 +618,54 @@ const MusicLyricsIndicator = GObject.registerClass(
 
                 this._updatePlayerInfo();
                 this._updateTrackInfo();
+                this._updatePlayPauseButton();
                 return true;
             } catch (e) {
+                logError(e, 'Failed to connect to Spotify');
                 return false;
             }
         }
 
+        _disconnectSpotify() {
+            if (this._propertiesChangedId && this._playerProxy) {
+                this._playerProxy.disconnect(this._propertiesChangedId);
+                this._propertiesChangedId = null;
+            }
+
+            if (this._lyricsTimeoutId) {
+                GLib.source_remove(this._lyricsTimeoutId);
+                this._lyricsTimeoutId = null;
+            }
+
+            this._proxy = null;
+            this._playerProxy = null;
+            this._currentTrack = null;
+            this._currentLyrics = null;
+            this._currentLine = '';
+            this._currentTrackDuration = null;
+            this._currentTrackDurationSeconds = null;
+            this._lastTrackTitle = null;
+            this._isShowingTrackTitle = false;
+            this._spotifyPids = [];
+            this._resetQualityVerification();
+
+            this._updateLabelText('');
+            this._updatePlayerInfo();
+            if (this._trackInfoItem) {
+                this._trackInfoItem.label.text = 'No track playing';
+            }
+            if (this._durationItem) {
+                this._durationItem.label.text = '--:--';
+            }
+        }
+
         _updatePlayerInfo() {
-            if (!this._currentBusName) {
+            if (!this._playerProxy) {
                 this._playerInfoItem.label.text = 'No player connected';
                 return;
             }
 
-            let playerName = 'Unknown Player';
-            let playerIcon = '♪';
-
-            if (this._currentBusName.includes('spotify')) {
-                playerName = 'Spotify';
-                playerIcon = '🎵';
-            } else if (this._currentBusName.includes('youtube-music')) {
-                playerName = 'YouTube Music';
-                playerIcon = '🎵';
-            } else if (this._currentBusName.includes('chromium')) {
-                playerName = 'Chromium';
-                playerIcon = '🌐';
-            } else if (this._currentBusName.includes('chrome')) {
-                playerName = 'Chrome';
-                playerIcon = '🌐';
-            } else if (this._currentBusName.includes('firefox')) {
-                playerName = 'Firefox';
-                playerIcon = '🌐';
-            } else if (this._currentBusName.includes('brave')) {
-                playerName = 'Brave';
-                playerIcon = '🌐';
-            } else if (this._currentBusName.includes('edge')) {
-                playerName = 'Edge';
-                playerIcon = '🌐';
-            }
-
-            this._playerInfoItem.label.text = `${playerIcon} Playing from ${playerName}`;
+            this._playerInfoItem.label.text = '🎵 Playing from Spotify';
         }
 
         _onPropertiesChanged() {
@@ -456,8 +681,12 @@ const MusicLyricsIndicator = GObject.registerClass(
             try {
                 const metadata = this._playerProxy.get_cached_property('Metadata');
                 if (!metadata) {
-                    this._updateLabelText('No music playing');
+                    this._updateLabelText('');
                     this._trackInfoItem.label.text = 'No track playing';
+                    this._currentTrackDuration = null;
+                    if (this._durationItem) {
+                        this._durationItem.label.text = '--:--';
+                    }
                     return;
                 }
 
@@ -466,10 +695,14 @@ const MusicLyricsIndicator = GObject.registerClass(
                 const artist = metadataDict['xesam:artist']?.deep_unpack()[0] || null;
                 const album = metadataDict['xesam:album']?.unpack() || null;
 
-                // If both title and artist are missing, show icon or nothing
+                // If both title and artist are missing
                 if (!title && !artist) {
-                    this._updateLabelText('♪');
+                    this._updateLabelText('');
                     this._trackInfoItem.label.text = 'Unknown track';
+                    this._currentTrackDuration = null;
+                    if (this._durationItem) {
+                        this._durationItem.label.text = '--:--';
+                    }
                     return;
                 }
 
@@ -482,26 +715,63 @@ const MusicLyricsIndicator = GObject.registerClass(
                 // Update menu with track info
                 this._trackInfoItem.label.text = `${this._currentTrack.artist} - ${this._currentTrack.title}`;
 
-                // Try to fetch lyrics if enabled
-                if (this._showLyrics) {
-                    this._fetchLyrics(this._currentTrack.title, this._currentTrack.artist);
-                } else {
-                    this._updateLabelText(`${this._currentTrack.artist} - ${this._currentTrack.title}`);
+                // Extract track duration
+                const lengthVariant = metadataDict['mpris:length'];
+                let formattedDur = null;
+                let durationSeconds = null;
+                if (lengthVariant) {
+                    const lengthUs = typeof lengthVariant.unpack === 'function'
+                        ? lengthVariant.unpack()
+                        : lengthVariant;
+                    formattedDur = formatDuration(lengthUs);
+                    if (lengthUs && !isNaN(Number(lengthUs))) {
+                        durationSeconds = Math.round(Number(lengthUs) / 1000000);
+                    }
                 }
+                this._currentTrackDuration = formattedDur;
+                this._currentTrackDurationSeconds = durationSeconds;
+
+                const previousTrackTitle = this._lastTrackTitle || '';
+                this._lastTrackTitle = this._currentTrack.title;
+
+                if (previousTrackTitle !== this._currentTrack.title) {
+                    this._resetQualityVerification();
+                    this._startQualityVerification();
+
+                    // Immediately display the new track title on the panel
+                    this._isShowingTrackTitle = true;
+                    this._currentLine = '';
+                    this._updateLabelText(this._currentTrack.title, false);
+
+                    // Try to fetch lyrics if enabled
+                    if (this._showLyrics) {
+                        this._fetchLyrics(this._currentTrack.title, this._currentTrackDurationSeconds);
+                    } else {
+                        this._isShowingTrackTitle = false;
+                        this._updateLabelText(this._currentTrack.title, false);
+                    }
+                } else if (this._showLyrics && !this._currentLyrics && !this._lyricsTimeoutId && !this._isShowingTrackTitle) {
+                    this._fetchLyrics(this._currentTrack.title, this._currentTrackDurationSeconds);
+                }
+
+                // Update duration and quality display
+                this._updateDurationDisplay();
             } catch (e) {
                 logError(e, 'Failed to get track info');
             }
         }
 
-        _fetchLyrics(title, artist) {
+        _fetchLyrics(title, actualDurationSeconds) {
             // Clear any existing lyrics timeout
             if (this._lyricsTimeoutId) {
                 GLib.source_remove(this._lyricsTimeoutId);
                 this._lyricsTimeoutId = null;
             }
+            this._currentLyrics = null;
+            this._currentLine = '';
 
-            // Build API URL
-            const url = `${LYRICS_API_URL}?artist_name=${encodeURIComponent(artist)}&track_name=${encodeURIComponent(title)}`;
+            // Search for lyrics using exact track title in the 'q' parameter
+            const url = `${LYRICS_API_URL}?q=${encodeURIComponent(title)}`;
 
             const file = Gio.File.new_for_uri(url);
 
@@ -509,28 +779,67 @@ const MusicLyricsIndicator = GObject.registerClass(
                 try {
                     const [success, contents] = source.load_contents_finish(result);
 
+                    // Check if current track changed while request was in flight
+                    if (this._currentTrack && this._currentTrack.title !== title) {
+                        return;
+                    }
+
                     if (!success) {
-                        this._updateLabelText(`${artist} - ${title}`);
+                        this._isShowingTrackTitle = false;
+                        this._updateLabelText(title, false);
                         return;
                     }
 
                     const decoder = new TextDecoder('utf-8');
                     const response = decoder.decode(contents);
-                    const data = JSON.parse(response);
+                    const records = JSON.parse(response);
 
-                    if (data.syncedLyrics) {
-                        this._currentLyrics = this._parseLRC(data.syncedLyrics);
+                    if (!Array.isArray(records) || records.length === 0) {
+                        this._isShowingTrackTitle = false;
+                        this._updateLabelText(title, false);
+                        return;
+                    }
+
+                    let candidates = records;
+                    if (typeof actualDurationSeconds === 'number' && actualDurationSeconds > 0) {
+                        // Filter records within +- 5 seconds drift duration
+                        const drifted = records.filter(r => {
+                            if (typeof r.duration !== 'number') return false;
+                            return Math.abs(r.duration - actualDurationSeconds) <= 5;
+                        });
+
+                        // Sort with the closest duration match with the actual duration
+                        drifted.sort((a, b) => {
+                            const diffA = Math.abs(a.duration - actualDurationSeconds);
+                            const diffB = Math.abs(b.duration - actualDurationSeconds);
+                            return diffA - diffB;
+                        });
+
+                        candidates = drifted;
+                    }
+
+                    // Go orderwise, look for syncedLyrics and use its timestamp
+                    let matchedLyrics = null;
+                    for (const record of candidates) {
+                        if (record.syncedLyrics && record.syncedLyrics.trim().length > 0) {
+                            matchedLyrics = record.syncedLyrics;
+                            break;
+                        }
+                    }
+
+                    if (matchedLyrics) {
+                        this._currentLyrics = this._parseLRC(matchedLyrics);
                         this._startLyricsDisplay();
-                    } else if (data.plainLyrics) {
-                        // Fallback to plain lyrics (show first line)
-                        const firstLine = data.plainLyrics.split('\n')[0];
-                        this._updateLabelText(firstLine || `${artist} - ${title}`);
                     } else {
-                        this._updateLabelText(`${artist} - ${title}`);
+                        // If no results within drifted seconds limit or no syncedlyrics found,
+                        // use its title instead of stuck firstline lyrics
+                        this._isShowingTrackTitle = false;
+                        this._updateLabelText(title, false);
                     }
                 } catch (e) {
                     logError(e, 'Failed to fetch lyrics');
-                    this._updateLabelText(`${artist} - ${title}`);
+                    this._isShowingTrackTitle = false;
+                    this._updateLabelText(title, false);
                 }
             });
         }
@@ -594,6 +903,10 @@ const MusicLyricsIndicator = GObject.registerClass(
                             const positionUs = reply.get_child_value(0).get_variant().get_int64();
                             const positionMs = positionUs / 1000; // Convert microseconds to milliseconds
 
+                            if (!this._currentLyrics || this._currentLyrics.length === 0) {
+                                return;
+                            }
+
                             // Find the current lyric line
                             let currentLine = this._currentLyrics[0].text;
 
@@ -605,8 +918,14 @@ const MusicLyricsIndicator = GObject.registerClass(
                             }
 
                             if (currentLine !== this._currentLine) {
+                                const isReplacingTitle = this._isShowingTrackTitle;
+                                this._isShowingTrackTitle = false;
                                 this._currentLine = currentLine;
-                                this._updateLabelText(currentLine);
+                                this._updateLabelText(
+                                    currentLine,
+                                    true,
+                                    isReplacingTitle ? 'slide-left' : 'vertical'
+                                );
                             }
                         } catch (e) {
                             logError(e, 'Failed to parse position');
@@ -618,14 +937,77 @@ const MusicLyricsIndicator = GObject.registerClass(
             }
         }
 
-        _updateLabelText(text = null) {
+        _updateLabelText(text = null, animate = false, animationType = 'vertical') {
+            if (!this._label || (typeof this._label.is_finalized === 'function' && this._label.is_finalized())) {
+                return;
+            }
+
             if (text !== null) {
                 this._currentText = text;
             }
 
-            const display = this._currentText || 'No music playing';
+            const display = this._currentText || '';
             const maxLength = this._settings.get_int('max-text-length');
-            this._label.set_text(this._truncateText(display, maxLength));
+            const newFormattedText = this._truncateText(display, maxLength);
+
+            if (!animate || !this._label.get_text() || this._label.get_text() === newFormattedText) {
+                this._label.remove_all_transitions();
+                this._label.translation_x = 0;
+                this._label.translation_y = 0;
+                this._label.opacity = 255;
+                this._label.set_text(newFormattedText);
+                return;
+            }
+
+            if (animationType === 'slide-left') {
+                // Horizontal right-to-left slide transition when replacing track title with lyrics
+                this._label.remove_all_transitions();
+                this._label.translation_y = 0;
+                this._label.ease({
+                    opacity: 0,
+                    translation_x: -24,
+                    duration: 180,
+                    mode: Clutter.AnimationMode.EASE_IN_QUAD,
+                    onComplete: () => {
+                        if (!this._label || (typeof this._label.is_finalized === 'function' && this._label.is_finalized())) {
+                            return;
+                        }
+                        this._label.set_text(newFormattedText);
+                        this._label.translation_x = 28;
+                        this._label.translation_y = 0;
+                        this._label.ease({
+                            opacity: 255,
+                            translation_x: 0,
+                            duration: 220,
+                            mode: Clutter.AnimationMode.EASE_OUT_QUAD
+                        });
+                    }
+                });
+            } else {
+                // Animate rollback / roll-up transition between synced lyric lines
+                this._label.remove_all_transitions();
+                this._label.translation_x = 0;
+                this._label.ease({
+                    opacity: 0,
+                    translation_y: -8,
+                    duration: 160,
+                    mode: Clutter.AnimationMode.EASE_IN_QUAD,
+                    onComplete: () => {
+                        if (!this._label || (typeof this._label.is_finalized === 'function' && this._label.is_finalized())) {
+                            return;
+                        }
+                        this._label.set_text(newFormattedText);
+                        this._label.translation_y = 8;
+                        this._label.translation_x = 0;
+                        this._label.ease({
+                            opacity: 255,
+                            translation_y: 0,
+                            duration: 180,
+                            mode: Clutter.AnimationMode.EASE_OUT_QUAD
+                        });
+                    }
+                });
+            }
         }
 
         _truncateText(text, maxLength) {
@@ -656,8 +1038,19 @@ const MusicLyricsIndicator = GObject.registerClass(
                 this._busWatchId = null;
             }
 
+            this._resetQualityVerification();
+            this._spotifyPids = [];
+            this._lastTrackTitle = null;
+
+            if (this._label) {
+                this._label.remove_all_transitions();
+                this._label = null;
+            }
+
             this._proxy = null;
             this._playerProxy = null;
+            this._durationItem = null;
+            this._playPauseButton = null;
             super.destroy();
         }
     });
@@ -717,5 +1110,7 @@ export default class MusicLyricsExtension extends Extension {
             // or just use addToStatusArea again (which is safer for right side)
             Main.panel.addToStatusArea('music-lyrics-indicator', this._indicator);
         }
+
+        this._indicator.updateVisibility();
     }
 }

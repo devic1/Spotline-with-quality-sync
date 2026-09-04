@@ -1,107 +1,84 @@
-# Music Lyrics GNOME Extension
+# Spotline (with Quality Sync)
 
-A GNOME Shell extension that displays the currently playing song from Spotify, YouTube Music, or any MPRIS-compatible player in the top bar. Shows lyrics when available, otherwise displays the song name and artist.
+A GNOME Shell extension that displays the currently playing Spotify song and real-time synchronized lyrics directly in your top panel, along with live audio quality stream metrics.
 
-## Features
+---
 
-- **Real-time synced lyrics** - Shows the current line of lyrics synchronized with playback
-- **Multi-player support** - Works with Spotify, YouTube Music, and other MPRIS players
-- Automatically fetches lyrics from LRCLIB (free, no API key required)
-- Falls back to song name and artist if lyrics aren't available
-- Updates in real-time as the song plays
-- Supports both synced (LRC format) and plain lyrics
-- Automatically switches between active players
+## ✨ Features & Improvements
 
-## Installation
+- **Accurate Lyrics Finder**:
+  - Searches LRCLIB (`/api/search?q=...`) using the exact track title.
+  - Automatically filters candidates within $\pm 5$ seconds duration drift and sorts by closest duration match to the playing track.
+  - Seamlessly falls back to the track title if no synced lyrics match, preventing stuck first lines or unsynced plain text.
 
-### System-wide installation (requires sudo):
+- **Added Quality Inspector (Zero-Debug Native)**:
+  - Verifies real download payload sizes and content bitrates **directly inside GNOME Shell** without requiring Spotify debug flags, wrapper scripts, or external Python daemons.
+  - Inspects active Spotify file descriptors in Linux `/proc/<pid>/fd/` and cursor positions (`pos:`) to identify the exact audio file in real time.
+  - **1.0-Second Stability Sampling**: Flags tracks as `Buffering (<size>MB)` during downloads so premature bitrates are never shown, calculating accurate bitrate once bytes stabilize.
+  - **10-Second Stream Polling**: Non-blocking periodic checks detect chunk growth on long tracks/podcasts and dynamically refresh metrics.
+
+- **Scrolling Animations**:
+  - **Horizontal Slide (Title $\rightarrow$ Lyrics)**: When a song starts, the title appears immediately. As soon as synced lyrics are loaded, the title slides out to the left and the first lyric slides smoothly in from the right.
+  - **Vertical Roll (Line $\rightarrow$ Line)**: Subtle vertical roll transitions animate subsequent lyric lines as playback advances.
+
+- **Duration & Live Stream Metrics**:
+  - Displays formatted song duration alongside real measured bitrate and stream cache size directly in the dropdown menu:
+    ```text
+    {duration} | ~{bitrate}kbps ({size}MB)
+    ```
+    *(e.g., `4m 55s | ~316kbps (11.1MB)`)*
+
+- **Spotify-Exclusive Tracking & Clean Panel Presence**:
+  - Exclusively monitors Spotify via MPRIS (`org.mpris.MediaPlayer2.spotify`), ignoring browser media sessions or other audio players.
+  - Automatically hides from the top bar when Spotify is closed or not running—no clutter or empty placeholder text.
+
+- **Interactive Playback Controls**:
+  - Control Spotify directly from the panel menu with Prev, Play/Pause, and Next buttons.
+
+---
+
+## 🚀 Installation
+
+### User Installation (Recommended):
+
 ```bash
-sudo mkdir -p /usr/share/gnome-shell/extensions/spotify-lyrics@gnome-shell-extension
-sudo cp -r * /usr/share/gnome-shell/extensions/spotify-lyrics@gnome-shell-extension/
+mkdir -p ~/.local/share/gnome-shell/extensions/spotify-lyrics-ext@devic1
+cp -r * ~/.local/share/gnome-shell/extensions/spotify-lyrics-ext@devic1/
 ```
 
-### User installation (no sudo required):
+### Reloading the Extension:
+
+- **On GNOME on Xorg (X11)**:
+  Press `Alt + F2`, type `r`, and press `Enter`.
+- **On Wayland**:
+  Log out and log back in.
+
+### Enable the Extension:
+
 ```bash
-mkdir -p ~/.local/share/gnome-shell/extensions/spotify-lyrics@gnome-shell-extension
-cp -r * ~/.local/share/gnome-shell/extensions/spotify-lyrics@gnome-shell-extension/
+gnome-extensions enable spotify-lyrics-ext@devic1
 ```
 
-### After installation:
+Or enable it via the **GNOME Extensions** application.
 
-1. Restart GNOME Shell:
-   - On X11: Press `Alt+F2`, type `r`, and press Enter
-   - On Wayland: Log out and log back in
+---
 
-2. Enable the extension:
-   ```bash
-   gnome-extensions enable spotify-lyrics@gnome-shell-extension
-   ```
+## 🛠️ Development & Debugging
 
-   Or use GNOME Extensions app.
-
-## How It Works
-
-The extension uses:
-- **LRCLIB API** - A free, open-source lyrics database (no API key needed)
-- **MPRIS DBus interface** - To monitor music playback from desktop apps and browsers
-- **LRC format parsing** - For time-synced lyrics that update as the song plays
-
-When a song plays, the extension:
-1. Detects active music players (desktop apps or browser tabs)
-2. Fetches synced lyrics from LRCLIB
-3. Parses the LRC timestamps
-4. Displays the current line based on playback position
-5. Updates every 500ms for smooth transitions
-6. Automatically switches to whichever player is currently playing
-
-## Requirements
-
-- GNOME Shell 45 or 46
-- Spotify, YouTube Music, or any MPRIS-compatible music player
-- DBus support (standard on most Linux systems)
-- Internet connection (for fetching lyrics)
-
-## Supported Players
-
-- **Spotify** - Desktop app and web player (in browser)
-- **YouTube Music** - Desktop app and web player (in browser)
-- **Browser-based players** - Works with Chromium, Chrome, Firefox, Brave, Edge
-- Any MPRIS-compatible media player
-
-The extension automatically detects music playing in your browser tabs and displays lyrics just like desktop apps.
-
-## Development
-
-To test changes:
+### View Extension Logs:
 ```bash
-# View logs
-journalctl -f -o cat /usr/bin/gnome-shell
-
-# Reload extension (X11 only)
-# Alt+F2, then type 'r' and press Enter
+journalctl -f -o cat /usr/bin/gnome-shell | grep -i spotify
 ```
 
-## Troubleshooting
+### Verify MPRIS Connection:
+```bash
+dbus-send --print-reply --dest=org.mpris.MediaPlayer2.spotify /org/mpris/MediaPlayer2 org.freedesktop.DBus.Properties.Get string:org.mpris.MediaPlayer2.Player string:Metadata
+```
 
-- **Extension not showing**: Check if a supported music player is running
-- **"No music playing" message**: Start your music player and play a song
-- **Browser players not detected**: Make sure your browser supports MPRIS (most modern browsers do). You may need to enable media control in browser settings
-- **No lyrics showing**: Not all songs have synced lyrics in the database. The extension will fall back to showing the song name
-- **Lyrics out of sync**: The extension relies on the player's position reporting. Try pausing and resuming the song
-- **Multiple players**: The extension prioritizes the currently playing player. If multiple players are active, it connects to the one that's playing
-- **Check available players**: List all MPRIS players on your system:
-  ```bash
-  dbus-send --session --dest=org.freedesktop.DBus --type=method_call --print-reply /org/freedesktop/DBus org.freedesktop.DBus.ListNames | grep mpris
-  ```
-- **Check player metadata**: Test if a specific player is working:
-  ```bash
-  # For Spotify
-  dbus-send --print-reply --dest=org.mpris.MediaPlayer2.spotify /org/mpris/MediaPlayer2 org.freedesktop.DBus.Properties.Get string:org.mpris.MediaPlayer2.Player string:Metadata
-  
-  # For browser players (replace instance number)
-  dbus-send --print-reply --dest=org.mpris.MediaPlayer2.chromium.instance12345 /org/mpris/MediaPlayer2 org.freedesktop.DBus.Properties.Get string:org.mpris.MediaPlayer2.Player string:Metadata
-  ```
-- **Check logs**: View GNOME Shell logs for errors:
-  ```bash
-  journalctl -f -o cat /usr/bin/gnome-shell
-  ```
+---
+
+## 👏 Credits & Acknowledgements
+
+* **Original Creator**: [d3osaju](https://github.com/d3osaju/Spotline) for creating the original Spotline / Music Lyrics extension.
+* **Enhancements & Fork**: [devic1](https://github.com/devic1/Spotline-with-quality-sync) for adding the native zero-debug quality inspector, periodic stream polling, accurate duration-matched lyrics finder, right-to-left slide animation, and duration metrics.
+
