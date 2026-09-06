@@ -4,6 +4,16 @@ A GNOME Shell extension that displays the currently playing Spotify song and rea
 
 ---
 
+## 📸 Screenshots
+
+### Top Bar Display
+![Top Bar Lyrics](screenshots/topbar.png)
+
+### Dropdown Menu & Quality Metrics
+![Dropdown Menu and Quality Metrics](screenshots/fullview.png)
+
+---
+
 ## ✨ Features & Improvements
 
 - **Accurate Lyrics Finder & Resilient Polling**:
