@@ -12,8 +12,19 @@ const SPOTIFY_BUS_NAME = 'org.mpris.MediaPlayer2.spotify';
 const MPRIS_PLAYER_PATH = '/org/mpris/MediaPlayer2';
 const MPRIS_PLAYER_INTERFACE = 'org.mpris.MediaPlayer2.Player';
 
-// Lyrics API configuration
-const LYRICS_API_URL = 'https://lrclib.net/api/search';
+// Lyrics API v2 (Beta) configuration
+const LYRICS_V2_SEARCH_URL = 'https://lrclib.net/api/v2/search';
+const LYRICS_GET_URL = 'https://lrclib.net/api/get';
+
+function cleanTrackTitle(title) {
+    if (!title) return '';
+    let t = title.replace(/\s*-\s*(Remastered|Remaster|Live|Mono|Stereo|Radio Edit|Single Version|Bonus Track|Male|Female).*$/i, '');
+    t = t.replace(/\s*\(feat\..*?\)/i, '');
+    t = t.replace(/\s*\[feat\..*?\]/i, '');
+    t = t.replace(/\s*\(From \".*?\"\)/i, '');
+    t = t.replace(/\s*\(.*?\)/g, '');
+    return t.trim();
+}
 
 // Helper function to format duration in microseconds to mm:ss with time units (e.g. 5m 00s or 1h 05m 20s)
 function formatDuration(microseconds) {
@@ -346,6 +357,33 @@ const MusicLyricsIndicator = GObject.registerClass(
             this._infoSubmenu.menu.addMenuItem(creditsItem);
 
             this.menu.addMenuItem(this._infoSubmenu);
+
+            this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+
+            // Full View App launcher
+            const openAppItem = new PopupMenu.PopupMenuItem('✨ Open Spotline App');
+            openAppItem.connect('activate', () => {
+                this._openFullApp();
+            });
+            this.menu.addMenuItem(openAppItem);
+        }
+
+        _openFullApp() {
+            try {
+                const appInfo = Gio.DesktopAppInfo.new('spotline-lyrics.desktop');
+                if (appInfo) {
+                    appInfo.launch([], global.create_app_launch_context(0, -1));
+                    return;
+                }
+            } catch (e) {
+                logError(e, 'Failed to launch Spotline via DesktopAppInfo');
+            }
+
+            try {
+                GLib.spawn_command_line_async('/home/devic/.local/bin/spotline-lyrics');
+            } catch (err) {
+                logError(err, 'Failed to spawn spotline-lyrics command');
+            }
         }
 
         _controlPlayback(action) {
@@ -838,9 +876,19 @@ const MusicLyricsIndicator = GObject.registerClass(
                 this._currentLine = '';
             }
 
-            // Search for lyrics using exact track title in the 'q' parameter
-            const url = `${LYRICS_API_URL}?q=${encodeURIComponent(title)}`;
+            const clean = cleanTrackTitle(title);
+            const artist = this._currentTrack?.artist && this._currentTrack.artist !== 'Unknown Artist'
+                ? this._currentTrack.artist
+                : '';
 
+            const searchUrl = artist
+                ? `${LYRICS_V2_SEARCH_URL}?track_name=${encodeURIComponent(clean || title)}&artist_name=${encodeURIComponent(artist)}`
+                : `${LYRICS_V2_SEARCH_URL}?q=${encodeURIComponent(clean || title)}`;
+
+            this._executeV2Search(searchUrl, title, clean, artist, actualDurationSeconds);
+        }
+
+        _executeV2Search(url, title, clean, artist, actualDurationSeconds, triedFallback = false) {
             const file = Gio.File.new_for_uri(url);
 
             file.load_contents_async(null, (source, result) => {
@@ -863,6 +911,12 @@ const MusicLyricsIndicator = GObject.registerClass(
                     const records = JSON.parse(response);
 
                     if (!Array.isArray(records) || records.length === 0) {
+                        if (!triedFallback) {
+                            // Try general fallback search query
+                            const fallbackUrl = `${LYRICS_V2_SEARCH_URL}?q=${encodeURIComponent(clean || title)}`;
+                            this._executeV2Search(fallbackUrl, title, clean, artist, actualDurationSeconds, true);
+                            return;
+                        }
                         this._scheduleLyricsRetry(title, actualDurationSeconds);
                         return;
                     }
@@ -875,36 +929,80 @@ const MusicLyricsIndicator = GObject.registerClass(
                             return Math.abs(r.duration - actualDurationSeconds) <= 5;
                         });
 
-                        // Sort with the closest duration match with the actual duration
-                        drifted.sort((a, b) => {
-                            const diffA = Math.abs(a.duration - actualDurationSeconds);
-                            const diffB = Math.abs(b.duration - actualDurationSeconds);
-                            return diffA - diffB;
-                        });
-
-                        candidates = drifted;
-                    }
-
-                    // Go orderwise, look for syncedLyrics and use its timestamp
-                    let matchedLyrics = null;
-                    for (const record of candidates) {
-                        if (record.syncedLyrics && record.syncedLyrics.trim().length > 0) {
-                            matchedLyrics = record.syncedLyrics;
-                            break;
+                        if (drifted.length > 0) {
+                            // Sort with the closest duration match with the actual duration
+                            drifted.sort((a, b) => {
+                                const diffA = Math.abs(a.duration - actualDurationSeconds);
+                                const diffB = Math.abs(b.duration - actualDurationSeconds);
+                                return diffA - diffB;
+                            });
+                            candidates = drifted;
                         }
                     }
 
-                    if (matchedLyrics) {
-                        this._clearLyricsRetry();
-                        this._currentLyrics = this._parseLRC(matchedLyrics);
-                        this._startLyricsDisplay();
+                    // Prioritize candidate with hasSyncedLyrics, then fallback to hasPlainLyrics
+                    let selectedCandidate = null;
+                    for (const cand of candidates) {
+                        if (cand.hasSyncedLyrics) {
+                            selectedCandidate = cand;
+                            break;
+                        }
+                    }
+                    if (!selectedCandidate && candidates.length > 0) {
+                        for (const cand of candidates) {
+                            if (cand.hasPlainLyrics) {
+                                selectedCandidate = cand;
+                                break;
+                            }
+                        }
+                        if (!selectedCandidate) {
+                            selectedCandidate = candidates[0];
+                        }
+                    }
+
+                    if (selectedCandidate && selectedCandidate.id) {
+                        this._fetchLyricsRecordById(selectedCandidate.id, title, actualDurationSeconds);
                     } else {
-                        // If no results within drifted seconds limit or no syncedlyrics found,
-                        // retry with backoff polling before giving up
                         this._scheduleLyricsRetry(title, actualDurationSeconds);
                     }
                 } catch (e) {
-                    logError(e, 'Failed to fetch lyrics');
+                    logError(e, 'Failed to search lyrics via v2 API');
+                    this._scheduleLyricsRetry(title, actualDurationSeconds);
+                }
+            });
+        }
+
+        _fetchLyricsRecordById(trackId, title, actualDurationSeconds) {
+            const url = `${LYRICS_GET_URL}/${trackId}`;
+            const file = Gio.File.new_for_uri(url);
+
+            file.load_contents_async(null, (source, result) => {
+                try {
+                    const [success, contents] = source.load_contents_finish(result);
+
+                    if (!this._currentTrack || this._currentTrack.title !== title) {
+                        this._clearLyricsRetry();
+                        return;
+                    }
+
+                    if (!success) {
+                        this._scheduleLyricsRetry(title, actualDurationSeconds);
+                        return;
+                    }
+
+                    const decoder = new TextDecoder('utf-8');
+                    const response = decoder.decode(contents);
+                    const record = JSON.parse(response);
+
+                    if (record && record.syncedLyrics && record.syncedLyrics.trim().length > 0) {
+                        this._clearLyricsRetry();
+                        this._currentLyrics = this._parseLRC(record.syncedLyrics);
+                        this._startLyricsDisplay();
+                    } else {
+                        this._scheduleLyricsRetry(title, actualDurationSeconds);
+                    }
+                } catch (e) {
+                    logError(e, 'Failed to fetch lyrics record from /api/get/{id}');
                     this._scheduleLyricsRetry(title, actualDurationSeconds);
                 }
             });

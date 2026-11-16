@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=Spotline Lyrics
+GenericName=Spotify Lyrics & Player
+Comment=Full view synchronized lyrics and music player for Spotify
+Exec=/home/devic/.local/bin/spotline-lyrics
+Icon=spotline-lyrics
+Terminal=false
+Type=Application
+Categories=AudioVideo;Audio;Player;
+StartupWMClass=spotline-lyrics
+Keywords=spotify;lyrics;music;spotline;synced;

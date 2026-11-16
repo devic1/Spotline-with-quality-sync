@@ -1,0 +1,94 @@
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <!-- Background Gradient -->
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#140b24" />
+      <stop offset="50%" stop-color="#1e1038" />
+      <stop offset="100%" stop-color="#0a0515" />
+    </linearGradient>
+
+    <!-- Outer Glow / Border Gradient -->
+    <linearGradient id="borderGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#00f2fe" />
+      <stop offset="40%" stop-color="#4facfe" />
+      <stop offset="70%" stop-color="#9b51e0" />
+      <stop offset="100%" stop-color="#1ed760" />
+    </linearGradient>
+
+    <!-- Vinyl Ring Gradient -->
+    <linearGradient id="vinylGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#2a1b4e" />
+      <stop offset="100%" stop-color="#110924" />
+    </linearGradient>
+
+    <!-- Vibrant Accent Gradient -->
+    <linearGradient id="accentGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1ed760" />
+      <stop offset="50%" stop-color="#00f2fe" />
+      <stop offset="100%" stop-color="#9b51e0" />
+    </linearGradient>
+
+    <!-- Glow Filter -->
+    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="16" result="blur" />
+      <feComposite in="SourceGraphic" in2="blur" operator="over" />
+    </filter>
+
+    <filter id="softGlow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="8" result="blur" />
+      <feComposite in="SourceGraphic" in2="blur" operator="over" />
+    </filter>
+  </defs>
+
+  <!-- Base Squircle -->
+  <rect x="16" y="16" width="480" height="480" rx="112" fill="url(#bgGrad)" />
+  <rect x="16" y="16" width="480" height="480" rx="112" stroke="url(#borderGrad)" stroke-width="6" opacity="0.8" />
+
+  <!-- Background Ambient Glow -->
+  <circle cx="210" cy="240" r="130" fill="#9b51e0" opacity="0.25" filter="url(#glow)" />
+  <circle cx="310" cy="270" r="110" fill="#1ed760" opacity="0.2" filter="url(#glow)" />
+
+  <!-- Stylized Vinyl / Disc on Left -->
+  <g transform="translate(180, 256)">
+    <!-- Vinyl Disc Body -->
+    <circle cx="0" cy="0" r="140" fill="url(#vinylGrad)" stroke="#3a2569" stroke-width="3" />
+    <!-- Grooves -->
+    <circle cx="0" cy="0" r="120" stroke="#442d7a" stroke-width="1.5" stroke-dasharray="8 6" opacity="0.6" />
+    <circle cx="0" cy="0" r="102" stroke="#442d7a" stroke-width="1.5" stroke-dasharray="12 8" opacity="0.5" />
+    <circle cx="0" cy="0" r="84" stroke="#442d7a" stroke-width="1.5" stroke-dasharray="6 6" opacity="0.4" />
+    <!-- Center Label -->
+    <circle cx="0" cy="0" r="54" fill="url(#accentGrad)" filter="url(#softGlow)" />
+    <circle cx="0" cy="0" r="18" fill="#140b24" />
+  </g>
+
+  <!-- Modern Music Note Floating in Front -->
+  <g filter="url(#glow)">
+    <!-- Stem 1 -->
+    <rect x="232" y="145" width="16" height="135" rx="8" fill="#ffffff" />
+    <!-- Stem 2 -->
+    <rect x="306" y="125" width="16" height="155" rx="8" fill="#ffffff" />
+    <!-- Top Beam connecting notes -->
+    <path d="M 232 165 C 265 145, 280 145, 322 125 L 322 150 C 280 170, 265 170, 232 190 Z" fill="url(#accentGrad)" />
+    <!-- Note Head 1 -->
+    <ellipse cx="216" cy="275" rx="30" ry="22" transform="rotate(-25 216 275)" fill="#ffffff" />
+    <!-- Note Head 2 -->
+    <ellipse cx="290" cy="275" rx="30" ry="22" transform="rotate(-25 290 275)" fill="url(#accentGrad)" />
+  </g>
+
+  <!-- Synced Lyrics Sound Wave Bars / Lyrics Lines on the Right -->
+  <g transform="translate(370, 200)">
+    <!-- Bar 1 (Short) -->
+    <rect x="0" y="0" width="60" height="12" rx="6" fill="#1ed760" opacity="0.9" />
+    <!-- Bar 2 (Active highlighted lyric line) -->
+    <rect x="0" y="24" width="95" height="16" rx="8" fill="#ffffff" filter="url(#softGlow)" />
+    <!-- Bar 3 (Medium) -->
+    <rect x="0" y="52" width="75" height="12" rx="6" fill="#00f2fe" opacity="0.85" />
+    <!-- Bar 4 (Long) -->
+    <rect x="0" y="76" width="90" height="12" rx="6" fill="#9b51e0" opacity="0.8" />
+    <!-- Bar 5 (Short) -->
+    <rect x="0" y="100" width="50" height="10" rx="5" fill="#a777e3" opacity="0.6" />
+  </g>
+
+  <!-- Corner Sparkle -->
+  <path d="M 410 90 Q 420 110 440 120 Q 420 130 410 150 Q 400 130 380 120 Q 400 110 410 90 Z" fill="#00f2fe" opacity="0.8" filter="url(#softGlow)" />
+</svg>

@@ -1,6 +1,6 @@
-# Spotline (with Quality Sync)
+# Spotline (with Quality Sync & Full View App)
 
-A GNOME Shell extension that displays the currently playing Spotify song and real-time synchronized lyrics directly in your top panel, along with live audio quality stream metrics.
+A GNOME Shell extension and native Ubuntu desktop app that displays the currently playing Spotify song and real-time synchronized lyrics directly in your top panel and in a full dual-pane view, along with live audio quality stream metrics.
 
 ---
 
@@ -16,11 +16,20 @@ A GNOME Shell extension that displays the currently playing Spotify song and rea
 
 ## ✨ Features & Improvements
 
-- **Accurate Lyrics Finder & Resilient Polling**:
-  - Searches LRCLIB (`/api/search?q=...`) using the exact track title.
-  - Automatically filters candidates within $\pm 5$ seconds duration drift and sorts by closest duration match to the playing track.
-  - **Resilient Retry Polling**: If the lyrics API returns an error (e.g. HTTP 503 Service Unavailable) or transient failure, Spotline runs backup retries with staggered intervals (1s, 3s, 6s, 12s) for up to 30 seconds per song before cleanly stopping.
-  - Seamlessly falls back to the track title if no synced lyrics match, preventing stuck first lines or unsynced plain text.
+- **Full View Ubuntu App (Standalone Desktop Experience)**:
+  - Open instantly with one click on the **"✨ Open Spotline App"** button right below the About menu, or from the Ubuntu application launcher.
+  - Features an aesthetic, modern music icon registered natively with Ubuntu's desktop environment (`spotline-lyrics.desktop`).
+  - **Full Screen Mode**: Covers the entire display for an immersive music & lyrics experience. Toggle anytime via the header button, Settings dialog, or by pressing <kbd>F11</kbd> / <kbd>Esc</kbd>.
+  - **Left Pane**: Centered square artwork from Spotify (`mpris:artUrl`), track title, Google Pixel Material You animated squiggly wave progress bar, and minimal playback controls (Previous, Play/Pause toggle, and Next).
+  - **Right Pane**: Karaoke-style synchronized lyrics with bright highlighting for the active lyric line, dimmed background lyrics, interactive line-click seeking (click any lyric to jump playback), and ultra-smooth 60 FPS kinetic auto-scrolling.
+  - **Change Lyrics Selector**: Queries LRCLIB v2 for top search candidates, filters out identical duplicate lyrics, shows major language badges (e.g. Tamil, English), and provides one-click radio selection with green/red sync status dots.
+  - **Display Settings**: Adjustable glass tint opacity, lyrics font size (16px to 36px), and background gradient glow saved in `~/.config/spotline/preferences.json`.
+
+- **Upgraded LRCLIB v2 (Beta) Integration**:
+  - Migrated to the new lightweight `/api/v2/search` endpoint + `/api/get/{id}` fetching in both the GNOME extension and the full desktop app.
+  - Filters candidates within $\pm 5$ seconds duration drift and sorts by closest duration match to the active Spotify song.
+  - Automatically prioritizes entries with `hasSyncedLyrics === true`, gracefully falling back to plain lyrics when synced versions are unavailable.
+  - **Resilient Retry Polling**: Staggered backup retries (1s, 3s, 6s, 12s) up to 30 seconds gracefully handle transient API 503 or network errors.
 
 - **Added Quality Inspector (Zero-Debug Native)**:
   - Verifies real download payload sizes and content bitrates **directly inside GNOME Shell** without requiring Spotify debug flags, wrapper scripts, or external Python daemons.
@@ -44,7 +53,7 @@ A GNOME Shell extension that displays the currently playing Spotify song and rea
   - Automatically hides from the top bar when Spotify is closed or not running—no clutter or empty placeholder text.
 
 - **Interactive Playback Controls**:
-  - Control Spotify directly from the panel menu with Prev, Play/Pause, and Next buttons.
+  - Control Spotify directly from the panel menu and the full view app with Prev, Play/Pause, and Next buttons.
 
 ---
 
